@@ -9,6 +9,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"math/rand"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -173,16 +174,22 @@ type tcpTransporter struct {
 	transactionID uint32
 	// Transaction id of the last verified response, used to detect late responses
 	lastSuccessfulTransactionID uint16
+	// Whether a verified response was received on the current connection
+	connVerified bool
 
 	tlsConfig *tls.Config
 }
 
 // defaultTCPTransporter creates a new tcpTransporter with default values.
 func defaultTCPTransporter(address string) tcpTransporter {
+	// random start avoids matching responses a gateway buffered for a previous client or process
+	transactionID := uint16(rand.Uint32())
 	return tcpTransporter{
-		Address:     address,
-		Timeout:     tcpTimeout,
-		IdleTimeout: tcpIdleTimeout,
+		Address:                     address,
+		Timeout:                     tcpTimeout,
+		IdleTimeout:                 tcpIdleTimeout,
+		transactionID:               uint32(transactionID),
+		lastSuccessfulTransactionID: transactionID,
 	}
 }
 
@@ -251,14 +258,16 @@ func (mb *tcpTransporter) readResponse(aduRequest []byte, data []byte) ([]byte, 
 		}
 
 		err = verify(aduRequest, aduResponse)
-		if v, ok := err.(errTransactionIDMismatch); ok && mb.isLateResponse(v.got, v.expected) {
-			// late response to an earlier, timed out request: discard it and
-			// keep reading until the matching response or the read deadline
+		if v, ok := err.(errTransactionIDMismatch); ok && (!mb.connVerified || mb.isLateResponse(v.got, v.expected)) {
+			// response to an earlier, timed out request or buffered by the gateway
+			// before this connection was verified: discard it and keep reading
+			// until the matching response or the read deadline
 			mb.logf("modbus: discard late response % x", aduResponse)
 			continue
 		}
 		if err == nil {
 			mb.lastSuccessfulTransactionID = binary.BigEndian.Uint16(aduResponse)
+			mb.connVerified = true
 			mb.logf("modbus: recv % x\n", aduResponse)
 		}
 
@@ -403,6 +412,7 @@ func (mb *tcpTransporter) close() (err error) {
 	if mb.conn != nil {
 		err = mb.conn.Close()
 		mb.conn = nil
+		mb.connVerified = false
 	}
 	return
 }

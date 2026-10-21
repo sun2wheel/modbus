@@ -188,7 +188,51 @@ func TestTCPLateResponseIsDiscarded(t *testing.T) {
 	}
 }
 
-// A response with a transaction id that was never outstanding is still an error.
+// A gateway that still buffers a response for a previous process must not fail
+// the first request on a new connection.
+func TestTCPForeignResponseBeforeFirstVerifiedResponseIsDiscarded(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	data := []byte{0xCA, 0xFE}
+	done := make(chan struct{})
+	defer close(done)
+
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		defer conn.Close()
+		current, err := readRequest(conn)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		_, _ = conn.Write(readInputRegistersResponse(t, current+30000, []byte{0xDE, 0xAD}))
+		_, _ = conn.Write(readInputRegistersResponse(t, current, data))
+		<-done
+	}()
+
+	handler := NewTCPClientHandler(ln.Addr().String())
+	handler.Timeout = 200 * time.Millisecond
+	client := NewClient(handler)
+
+	resp, err := client.ReadInputRegisters(0, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(resp, data) {
+		t.Fatalf("got wrong response: got %x wanted %x", resp, data)
+	}
+}
+
+// Once the connection is verified, a response with a transaction id that was
+// never outstanding is still an error.
 func TestTCPUnexpectedTransactionIDFails(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -206,18 +250,24 @@ func TestTCPUnexpectedTransactionIDFails(t *testing.T) {
 			return
 		}
 		defer conn.Close()
-		current, err := readRequest(conn)
-		if err != nil {
-			t.Error(err)
-			return
+		for _, offset := range []uint16{0, 5} {
+			current, err := readRequest(conn)
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			_, _ = conn.Write(readInputRegistersResponse(t, current+offset, []byte{0xCA, 0xFE}))
 		}
-		_, _ = conn.Write(readInputRegistersResponse(t, current+5, []byte{0xCA, 0xFE}))
 		<-done
 	}()
 
 	handler := NewTCPClientHandler(ln.Addr().String())
 	handler.Timeout = 200 * time.Millisecond
 	client := NewClient(handler)
+
+	if _, err := client.ReadInputRegisters(0, 1); err != nil {
+		t.Fatal(err)
+	}
 
 	_, err = client.ReadInputRegisters(0, 1)
 	if _, ok := err.(errTransactionIDMismatch); !ok {
