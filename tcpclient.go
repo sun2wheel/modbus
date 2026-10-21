@@ -171,6 +171,8 @@ type tcpTransporter struct {
 
 	// For synchronization between messages of server & client
 	transactionID uint32
+	// Transaction id of the last verified response, used to detect late responses
+	lastSuccessfulTransactionID uint16
 
 	tlsConfig *tls.Config
 }
@@ -237,22 +239,39 @@ func (mb *tcpTransporter) Send(aduRequest []byte) (aduResponse []byte, err error
 }
 
 func (mb *tcpTransporter) readResponse(aduRequest []byte, data []byte) ([]byte, error) {
-	_, err := io.ReadFull(mb.conn, data[:tcpHeaderSize])
-	if err != nil {
-		return nil, err
-	}
+	for {
+		_, err := io.ReadFull(mb.conn, data[:tcpHeaderSize])
+		if err != nil {
+			return nil, err
+		}
 
-	aduResponse, err := mb.processResponse(data[:])
-	if err != nil {
-		return nil, err
-	}
+		aduResponse, err := mb.processResponse(data[:])
+		if err != nil {
+			return nil, err
+		}
 
-	err = verify(aduRequest, aduResponse)
-	if err == nil {
-		mb.logf("modbus: recv % x\n", aduResponse)
-	}
+		err = verify(aduRequest, aduResponse)
+		if v, ok := err.(errTransactionIDMismatch); ok && mb.isLateResponse(v.got, v.expected) {
+			// late response to an earlier, timed out request: discard it and
+			// keep reading until the matching response or the read deadline
+			mb.logf("modbus: discard late response % x", aduResponse)
+			continue
+		}
+		if err == nil {
+			mb.lastSuccessfulTransactionID = binary.BigEndian.Uint16(aduResponse)
+			mb.logf("modbus: recv % x\n", aduResponse)
+		}
 
-	return aduResponse, err
+		return aduResponse, err
+	}
+}
+
+// isLateResponse reports whether transaction id got belongs to a request sent
+// after the last successful one but before the current request expected.
+// Uses uint16 wrap-around arithmetic.
+func (mb *tcpTransporter) isLateResponse(got, expected uint16) bool {
+	age := expected - got
+	return age > 0 && age < expected-mb.lastSuccessfulTransactionID
 }
 
 func (mb *tcpTransporter) processResponse(data []byte) (aduResponse []byte, err error) {
